@@ -20,7 +20,7 @@ Use it for any passwords stored locally, journals, etc.
 Clone the repository and navigate into it:
 
 ```bash
-git clone https://github.com/yourusername/passcrypt.git
+git clone https://github.com/Banois/passcrypt.git
 cd passcrypt
 python passcrypt.py
 ```
