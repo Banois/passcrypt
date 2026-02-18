@@ -1,11 +1,16 @@
 # -*- coding: cp1252 -*-
-# PassCrypt v5.2 - 5-Layer Encryption Tool
+# PassCrypt v5.3 - 5-Layer Encryption Tool
 # Short Mode: compress_then_encrypt for compact printable output
 import base64
 import hashlib
 import secrets
 import hmac
 import os
+import getpass
+import ctypes
+from ctypes import wintypes
+import gc
+import time
 import zlib
 from typing import Tuple, List, Optional
 
@@ -13,7 +18,7 @@ from typing import Tuple, List, Optional
 # VERSION & CONSTANTS
 # =============================================================================
 
-VERSION = b'PC52'  # PassCrypt v5.2 format identifier
+VERSION = b'PC53'  # PassCrypt v5.3 format identifier
 
 # =============================================================================
 # INPUT HELPERS
@@ -21,6 +26,12 @@ VERSION = b'PC52'  # PassCrypt v5.2 format identifier
 
 class UserExit(Exception):
     """Raised when user types 'exit' to quit"""
+    pass
+
+
+class LegacyVersionError(ValueError):
+    """Raised when a legacy tagged payload is detected in normal decrypt flow."""
+
     pass
 
 def get_input(prompt: str, allow_empty: bool = False) -> str:
@@ -63,6 +74,136 @@ def get_int(prompt: str, min_val: int = None) -> int:
             return num
         except ValueError:
             print("Please enter a valid number.")
+
+def get_password_input(prompt: str, hide_input: bool) -> str:
+    """Get password input, optionally hidden, with exit command support."""
+    if not hide_input:
+        return get_input(prompt)
+
+    while True:
+        try:
+            value = getpass.getpass(prompt).strip()
+        except Exception:
+            print("Hidden password input is unavailable in this terminal. Falling back to visible input.")
+            return get_input(prompt)
+
+        if value.lower() == 'exit':
+            raise UserExit()
+        if value:
+            return value
+        print("Input cannot be empty. Type 'exit' to quit.")
+
+# =============================================================================
+# CLIPBOARD HELPERS
+# =============================================================================
+
+def copy_to_clipboard_private(text: str) -> bool:
+    """
+    Copy text to clipboard on Windows while requesting exclusion from clipboard
+    history and cloud clipboard sync.
+    """
+    if os.name != 'nt':
+        return False
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
+
+    def _alloc_global(raw: bytes):
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(raw))
+        if not handle:
+            return None
+        locked = kernel32.GlobalLock(handle)
+        if not locked:
+            kernel32.GlobalFree(handle)
+            return None
+        ctypes.memmove(locked, raw, len(raw))
+        kernel32.GlobalUnlock(handle)
+        return handle
+
+    # Retry briefly in case clipboard is temporarily locked by another process.
+    opened = False
+    for _ in range(8):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+    if not opened:
+        return False
+
+    try:
+        if not user32.EmptyClipboard():
+            return False
+
+        utf16 = text.encode('utf-16-le') + b'\x00\x00'
+        text_handle = _alloc_global(utf16)
+        if not text_handle:
+            return False
+        if not user32.SetClipboardData(CF_UNICODETEXT, text_handle):
+            kernel32.GlobalFree(text_handle)
+            return False
+
+        # Request exclusion from clipboard history and cloud sync.
+        for fmt_name in ("CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"):
+            fmt_id = user32.RegisterClipboardFormatW(fmt_name)
+            if fmt_id:
+                flag_handle = _alloc_global((0).to_bytes(4, 'little', signed=False))
+                if flag_handle and not user32.SetClipboardData(fmt_id, flag_handle):
+                    kernel32.GlobalFree(flag_handle)
+
+        return True
+    finally:
+        user32.CloseClipboard()
+
+def _wipe_bytearray(buf: Optional[bytearray]) -> None:
+    """Best-effort in-place wipe for mutable byte buffers."""
+    if not isinstance(buf, bytearray):
+        return
+    for i in range(len(buf)):
+        buf[i] = 0
+    buf.clear()
+
+def _wipe_bytes_copy(buf: Optional[bytes]) -> None:
+    """
+    Best-effort wipe for immutable bytes by copying to a mutable buffer, wiping,
+    then dropping references. Original immutable object cannot be guaranteed wiped.
+    """
+    if not isinstance(buf, bytes):
+        return
+    temp = bytearray(buf)
+    _wipe_bytearray(temp)
+
+def _wipe_password_list(passwords: Optional[List[str]]) -> None:
+    """Best-effort overwrite and clear of password list references."""
+    if not isinstance(passwords, list):
+        return
+    for i, pw in enumerate(passwords):
+        if isinstance(pw, str) and pw:
+            passwords[i] = '\0' * len(pw)
+        else:
+            passwords[i] = ''
+    passwords.clear()
 
 # =============================================================================
 # KEY DERIVATION & AUTHENTICATION HELPERS
@@ -413,12 +554,13 @@ def encrypt_text(text: str, passwords: List[str], max_length: int = None) -> byt
     data = layer5_encrypt(data, layer_passwords[4], max_length)
     return VERSION + key_salt + data
 
-def decrypt_text(data: bytes, passwords: List[str]) -> str:
+def decrypt_text(data: bytes, passwords: List[str]) -> bytes:
+    """Decrypt current-version payload only."""
     if len(data) < 20:
         raise ValueError("Decryption failed")
     version = data[:4]
     if version != VERSION:
-        raise ValueError("Decryption failed - incompatible format version")
+        raise LegacyVersionError("Legacy file detected")
     key_salt = data[4:20]
     encrypted = data[20:]
     if len(passwords) == 1:
@@ -432,7 +574,7 @@ def decrypt_text(data: bytes, passwords: List[str]) -> str:
     data = layer3_decrypt(data, layer_passwords[2])
     data = layer2_decrypt(data, layer_passwords[1])
     data = layer1_decrypt(data, layer_passwords[0])
-    return data.decode('utf-8')
+    return data
 
 # =============================================================================
 # MAIN CLI
@@ -444,9 +586,20 @@ def estimate_base85_len(byte_len: int) -> int:
 
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print("PassCrypt v5.2 - 5-Layer Encryption Tool")
+    print("PassCrypt v5.3 - 5-Layer Encryption Tool")
     print("=" * 60)
     print("Type 'exit' at any prompt to quit.\n")
+
+    # Keep sensitive references in a small scope and scrub on exit.
+    passwords: List[str] = []
+    raw_data = None
+    encrypted_bytes = None
+    enc_bytes = None
+    plaintext_bytes = None
+    decrypted_buffer: Optional[bytearray] = None
+    text = None
+    final_output = None
+    interrupted = False
 
     try:
         choice = get_choice("Enter 1 to encrypt or 2 to decrypt: ", ['1', '2'])
@@ -457,90 +610,223 @@ def main():
         mode_choice = get_choice("Enter mode (1= simple, 2= advanced, 3= short): ", ['1', '2', '3'])
         mode = 'simple' if mode_choice == '1' else ('advanced' if mode_choice == '2' else 'short')
 
-        pw_mode = get_choice("Enter 1 for single master password or 2 for 5 separate passwords: ", ['1', '2'])
-        multi_password = (pw_mode == '2')
-
-        # Collect passwords
-        if multi_password:
-            print("\nEnter 5 passwords (one for each layer):")
-            passwords = []
-            for i in range(1, 6):
-                pw = get_input(f'  Layer {i} password: ')
-                passwords.append(pw)
-        else:
-            passwords = [get_input("\nEnter master password: ")]
-
         if choice == '2':
             # DECRYPTION
-            input_choice = get_choice("\nEnter 1 to input from file or 2 to input text directly: ", ['1', '2'])
-            if input_choice == '1':
+            while True:
                 file_path = None
-                if os.name == 'nt':
-                    try:
-                        import tkinter as tk
-                        from tkinter import filedialog
-                        print("\nOpening file explorer...")
-                        root = tk.Tk()
-                        root.withdraw()
-                        root.attributes('-topmost', True)
-                        file_path = filedialog.askopenfilename(
-                            title="Select encrypted file",
-                            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-                        )
-                        root.destroy()
-                        if not file_path:
-                            print("No file selected.")
-                            file_path = None
-                    except Exception:
-                        file_path = None
-                if not file_path:
-                    file_path = get_input("Enter file path: ")
                 try:
-                    if mode == 'advanced':
-                        with open(file_path, 'rb') as f:
-                            raw_data = f.read()
+                    input_choice = get_choice("\nEnter 1 to input from file or 2 to input text directly: ", ['1', '2'])
+                    if input_choice == '1':
+                        file_path = None
+                        if os.name == 'nt':
+                            try:
+                                import tkinter as tk
+                                from tkinter import filedialog
+                                print("\nOpening file explorer...")
+                                root = tk.Tk()
+                                root.withdraw()
+                                root.attributes('-topmost', True)
+                                file_path = filedialog.askopenfilename(
+                                    title="Select encrypted file",
+                                    filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+                                )
+                                root.destroy()
+                                if not file_path:
+                                    print("No file selected.")
+                                    file_path = None
+                            except Exception:
+                                file_path = None
+                        if not file_path:
+                            file_path = get_input("Enter file path: ")
+                        if mode == 'advanced':
+                            with open(file_path, 'rb') as f:
+                                raw_data = f.read()
+                        else:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                raw_data = f.read().strip()
+                        print(f"Loaded from: {file_path}")
                     else:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            raw_data = f.read().strip()
-                    print(f"Loaded from: {file_path}")
+                        raw_data = get_input("Enter encrypted text: ")
+
+                    pw_mode = get_choice("Enter 1 for single master password or 2 for 5 separate passwords: ", ['1', '2'])
+                    multi_password = (pw_mode == '2')
+                    show_chars = get_yes_no("Show decryption password characters while typing? (y/n): ")
+                    hide_decrypt_password = not show_chars
+
+                    if multi_password:
+                        print("\nEnter 5 passwords (one for each layer):")
+                        passwords = []
+                        for i in range(1, 6):
+                            pw = get_password_input(f'  Layer {i} password: ', hide_decrypt_password)
+                            passwords.append(pw)
+                    else:
+                        passwords = [get_password_input("\nEnter master password: ", hide_decrypt_password)]
+
+                    if mode == 'simple':
+                        encrypted_bytes = _simple_decode(raw_data)
+                        decrypted_bytes = decrypt_text(encrypted_bytes, passwords)
+                    elif mode == 'short':
+                        enc_bytes = _simple_decode(raw_data)
+                        decrypted_bytes = short_decrypt_bytes(enc_bytes, passwords[0])
+                    else:
+                        encrypted_bytes = raw_data if isinstance(raw_data, bytes) else raw_data.encode('latin-1')
+                        decrypted_bytes = decrypt_text(encrypted_bytes, passwords)
+
+                    decrypted_buffer = bytearray(decrypted_bytes)
+                    _wipe_bytes_copy(decrypted_bytes)
+                    decrypted_bytes = b''
+
+                    if get_yes_no("\nDo you want to access the decrypted output? (y/n): "):
+                        show_mode = get_choice(
+                            "Choose output: 1 = copy to clipboard, 2 = display in terminal: ",
+                            ['1', '2']
+                        )
+                        if show_mode == '1':
+                            text_view = decrypted_buffer.decode('utf-8', errors='replace')
+                            if copy_to_clipboard_private(text_view):
+                                print("Decrypted text copied to clipboard (clipboard history suppressed).")
+                            else:
+                                print("Clipboard copy failed.")
+                            text_view = None
+                        else:
+                            text_view = decrypted_buffer.decode('utf-8', errors='replace')
+                            print(f"\nDecrypted text:\n{text_view}")
+                            text_view = None
+
+                    if get_yes_no("\nSave to file? (y/n): "):
+                        filename = get_input("Enter filename: ")
+                        script_dir = os.path.dirname(os.path.abspath(__file__))
+                        filepath = os.path.join(script_dir, filename)
+                        text_view = decrypted_buffer.decode('utf-8', errors='replace')
+                        with open(filepath, 'w', encoding='utf-8') as f:
+                            f.write(text_view)
+                        text_view = None
+                        print(f"Saved to: {filepath}")
+                    break
+
                 except FileNotFoundError:
                     print(f"File not found: {file_path}")
+                    if get_yes_no("Try again from file/text selection? (y/n): "):
+                        continue
+                    return
+                except LegacyVersionError:
+                    print("\nLegacy or invalid header detected.")
+                    print("Warning: Changing the header may fail if the encryption process changed between versions.")
+                    header_choice = get_choice(
+                        "Choose: [1] replace file, [2] save to new location, [3] quit: ",
+                        ['1', '2', '3']
+                    )
+                    if header_choice == '3':
+                        return
+
+                    if not isinstance(encrypted_bytes, bytes) or len(encrypted_bytes) < 4:
+                        print("Unable to update header for this input.")
+                        if get_yes_no("Try again from file/text selection? (y/n): "):
+                            continue
+                        return
+
+                    patched_bytes = VERSION + encrypted_bytes[4:]
+                    output_path = None
+
+                    if header_choice == '1':
+                        if not file_path:
+                            print("Replace is only available when input is loaded from a file.")
+                            header_choice = '2'
+                        else:
+                            output_path = file_path
+
+                    if header_choice == '2':
+                        path_choice = get_choice(
+                            "Enter 1 to choose save path in file explorer or 2 to type path: ",
+                            ['1', '2']
+                        )
+                        if path_choice == '1' and os.name == 'nt':
+                            try:
+                                import tkinter as tk
+                                from tkinter import filedialog
+                                print("\nOpening save dialog...")
+                                root = tk.Tk()
+                                root.withdraw()
+                                root.attributes('-topmost', True)
+                                if mode == 'advanced':
+                                    output_path = filedialog.asksaveasfilename(
+                                        title="Save header-updated file",
+                                        defaultextension=".bin",
+                                        filetypes=[("Binary files", "*.bin"), ("All files", "*.*")]
+                                    )
+                                else:
+                                    output_path = filedialog.asksaveasfilename(
+                                        title="Save header-updated file",
+                                        defaultextension=".txt",
+                                        filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+                                    )
+                                root.destroy()
+                                if not output_path:
+                                    output_path = None
+                            except Exception:
+                                output_path = None
+                        if not output_path:
+                            output_path = get_input("Enter output file path: ")
+
+                    try:
+                        if mode == 'advanced':
+                            with open(output_path, 'wb') as f:
+                                f.write(patched_bytes)
+                        else:
+                            with open(output_path, 'w', encoding='utf-8') as f:
+                                f.write(_simple_encode(patched_bytes))
+                        print(f"Header updated and saved to: {output_path}")
+                    except Exception as e:
+                        print(f"Failed to save updated header file: {e}")
+                    finally:
+                        _wipe_bytes_copy(patched_bytes)
+                        patched_bytes = None
+
+                    if get_yes_no("Return to decrypt start? (y/n): "):
+                        continue
+                    return
+                except ValueError:
+                    print(f"\nDecryption failed. Check password and mode.")
+                    if get_yes_no("Try again from file/text selection? (y/n): "):
+                        continue
                     return
                 except Exception as e:
-                    print(f"Error reading file: {e}")
+                    print(f"\nError: {e}")
+                    if get_yes_no("Try again from file/text selection? (y/n): "):
+                        continue
                     return
-            else:
-                raw_data = get_input("Enter encrypted text: ")
-
-            try:
-                if mode == 'simple':
-                    encrypted_bytes = _simple_decode(raw_data)
-                    decrypted = decrypt_text(encrypted_bytes, passwords)
-                elif mode == 'short':
-                    enc_bytes = _simple_decode(raw_data)
-                    decrypted = short_decrypt_bytes(enc_bytes, passwords[0]).decode('utf-8', errors='replace')
-                else:
-                    encrypted_bytes = raw_data if isinstance(raw_data, bytes) else raw_data.encode('latin-1')
-                    decrypted = decrypt_text(encrypted_bytes, passwords)
-
-                if get_yes_no("\nShow decrypted text? (y/n): "):
-                    print(f"\nDecrypted text:\n{decrypted}")
-
-                if get_yes_no("\nSave to file? (y/n): "):
-                    filename = get_input("Enter filename: ")
-                    script_dir = os.path.dirname(os.path.abspath(__file__))
-                    filepath = os.path.join(script_dir, filename)
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        f.write(decrypted)
-                    print(f"Saved to: {filepath}")
-
-            except ValueError:
-                print(f"\nDecryption failed. Check password and mode.")
-            except Exception as e:
-                print(f"\nError: {e}")
+                finally:
+                    _wipe_password_list(passwords)
+                    passwords = []
+                    if isinstance(raw_data, bytes):
+                        _wipe_bytes_copy(raw_data)
+                    raw_data = None
+                    if isinstance(encrypted_bytes, bytes):
+                        _wipe_bytes_copy(encrypted_bytes)
+                    encrypted_bytes = None
+                    if isinstance(enc_bytes, bytes):
+                        _wipe_bytes_copy(enc_bytes)
+                    enc_bytes = None
+                    _wipe_bytearray(decrypted_buffer)
+                    decrypted_buffer = None
 
         else:
             # ENCRYPTION
+            pw_mode = get_choice("Enter 1 for single master password or 2 for 5 separate passwords: ", ['1', '2'])
+            multi_password = (pw_mode == '2')
+            show_chars = get_yes_no("Show encryption password characters while typing? (y/n): ")
+            hide_encrypt_password = not show_chars
+
+            # Collect passwords
+            if multi_password:
+                print("\nEnter 5 passwords (one for each layer):")
+                passwords = []
+                for i in range(1, 6):
+                    pw = get_password_input(f'  Layer {i} password: ', hide_encrypt_password)
+                    passwords.append(pw)
+            else:
+                passwords = [get_password_input("\nEnter master password: ", hide_encrypt_password)]
+
             text = get_input("\nEnter text to encrypt: ")
 
             if mode == 'short':
@@ -599,6 +885,40 @@ def main():
 
     except UserExit:
         print("\nExiting...")
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nInterrupted. Clearing now...")
+    finally:
+        _wipe_password_list(passwords)
+        passwords = []
+
+        if isinstance(raw_data, bytes):
+            _wipe_bytes_copy(raw_data)
+        raw_data = None
+
+        if isinstance(encrypted_bytes, bytes):
+            _wipe_bytes_copy(encrypted_bytes)
+        encrypted_bytes = None
+
+        if isinstance(enc_bytes, bytes):
+            _wipe_bytes_copy(enc_bytes)
+        enc_bytes = None
+
+        if isinstance(plaintext_bytes, bytes):
+            _wipe_bytes_copy(plaintext_bytes)
+        plaintext_bytes = None
+
+        _wipe_bytearray(decrypted_buffer)
+        decrypted_buffer = None
+
+        text = None
+        final_output = None
+        gc.collect()
+
+        if not interrupted:
+            print("\nClearing in 3 seconds...")
+            time.sleep(3)
+        os.system('cls' if os.name == 'nt' else 'clear')
 
 if __name__ == "__main__":
     main()
